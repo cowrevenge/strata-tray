@@ -1,0 +1,40 @@
+# StrataTray
+
+Windows tray controller for a local [Strata](https://github.com/Niko1221/Strata) LLM server.
+
+- **Start WebUI / Stop WebUI**: the Strata server. Starts lazily (`--lazy`): the server is up in
+  seconds with no model loaded, the model loads on first request or **Load Model**.
+- **Load Model / Unload Model**: frees or fills VRAM and RAM while the server keeps running.
+- **Open Browser**: the Strata web UI (only while the server is up).
+- **Settings**: unload the model after N idle minutes (off by default). Writes Strata's own
+  `idle_unload_s` into the run config (backup kept); Strata does the idle check and reloads on the
+  next request.
+- **Exit**: stops the server, then closes the tray.
+
+Tray badge: green = model loaded, blue moon = server up / model unloaded, amber = loading,
+grey = stopped. The tray starts the WebUI on launch if nothing is on the port.
+
+Server output (Strata's own `[strata]` diagnostics) goes to `C:\Strata\server.log`
+(previous run kept as `server.log.1`).
+
+## Build
+
+Uses the C# compiler that ships with Windows (.NET Framework 4.x), nothing to install:
+
+```
+build.cmd
+```
+
+Paths, port and run-config name are constants at the top of `StrataTray.cs`.
+
+## Start at login
+
+```powershell
+$s=(New-Object -ComObject WScript.Shell).CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\StrataTray.lnk"); $s.TargetPath='C:\Strata\tray\StrataTray.exe'; $s.WorkingDirectory='C:\Strata\tray'; $s.Save()
+```
+
+## Design notes
+
+- All state checks run on a background thread every 5 s; the menu draws from the cached state, so
+  it never blocks. Detection is the TCP listener table plus `GET /v1/status` (`loaded`), not WMI.
+- WMI is only used on Stop, when the tray did not launch the server itself.
