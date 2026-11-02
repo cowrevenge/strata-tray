@@ -11,6 +11,15 @@
 // v10: Start WebUI uses Strata's --lazy (server up, model unloaded until Load Model or the first
 //      request). The tray starts the WebUI on launch if it is not already up.
 // v11: the server's own output (its [strata] diagnostics) goes to C:\Strata\server.log.
+// v12: Model submenu. Every strata-*.json in C:\Strata is a model; picking one switches the
+//      run config (stopping and starting the server when it is up) and is remembered in
+//      %APPDATA%\StrataTray\settings.json.
+// v13: a control port on 127.0.0.1:8081 so a client can ask for a model by name:
+//        GET  /model            -> {"model":...,"state":...,"models":[...]}
+//        POST /model {"model":"<name>"}  -> switches the run config and returns when the
+//                                            server is listening again (Strata loads lazily,
+//                                            so the weights load inside the caller's own
+//                                            first request, as they always did).
 // Build: build.cmd (uses the C# compiler that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -22,6 +31,7 @@ using System.IO;
 using System.Management;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -30,8 +40,8 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("StrataTray")]
 [assembly: AssemblyProduct("StrataTray")]
-[assembly: AssemblyVersion("11.0.0.0")]
-[assembly: AssemblyFileVersion("11.0.0.0")]
+[assembly: AssemblyVersion("13.0.0.0")]
+[assembly: AssemblyFileVersion("13.0.0.0")]
 
 static class Program
 {
@@ -39,8 +49,11 @@ static class Program
     const string Root   = @"C:\Strata";
     const string Python = Root + @"\.venv\Scripts\python.exe";
     const string Server = Root + @"\serve\server.py";
-    const string Config = Root + @"\strata-nvfp4-nvfp4-qad.json";
+    const string FallbackConfig = Root + @"\strata-nvfp4-nvfp4-qad.json";
+    static string Config;                                    // the run config in use
+    static readonly List<string> Configs = new List<string>();   // every strata-*.json in Root
     const int    Port   = 8080;
+    const int    ControlPort = 8081;        // where a client asks for a model by name
     static readonly string Url = "http://127.0.0.1:" + Port + "/";
     static readonly string[] EngineNames = { "strata", "strata-vision" };
     static readonly string TraySettings = Path.Combine(
@@ -51,7 +64,7 @@ static class Program
     enum State { Stopped, Starting, Running, Sleeping, Stopping }
 
     static NotifyIcon tray;
-    static ToolStripMenuItem toggleItem, loadItem, browserItem, settingsItem;
+    static ToolStripMenuItem toggleItem, loadItem, browserItem, settingsItem, modelMenu;
     static Icon iconRunning, iconStarting, iconStopped, iconSleeping;
     static Form syncForm;                       // hidden; owns the UI thread for BeginInvoke
 
@@ -84,19 +97,26 @@ static class Program
         iconSleeping = MakeIcon(appIcon, Color.FromArgb(40, 100, 255), true);
         iconStopped  = MakeIcon(appIcon, Color.FromArgb(120, 120, 120), false);
 
+        DiscoverConfigs();
+        Config = LoadTrayConfig();
+        if (Config == null) Config = (Configs.Count > 0) ? Configs[0] : FallbackConfig;
+
         ContextMenuStrip menu = new ContextMenuStrip();
         toggleItem = new ToolStripMenuItem("Start WebUI", null, OnToggle);
         loadItem = new ToolStripMenuItem("Unload Model", null, OnLoadToggle);
         browserItem = new ToolStripMenuItem("Open Browser", null, OnOpenBrowser);
         settingsItem = new ToolStripMenuItem("Settings...", null, OnSettings);
+        modelMenu = new ToolStripMenuItem("Model");
+        BuildModelMenu();
         menu.Items.Add(toggleItem);
         menu.Items.Add(loadItem);
         menu.Items.Add(browserItem);
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(modelMenu);
         menu.Items.Add(settingsItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("Exit", null, OnExit));
-        menu.Opening += delegate { UpdateUi(); pollNow.Set(); };   // draw from cache, refresh soon, never block
+        menu.Opening += delegate { RefreshModelMenu(); UpdateUi(); pollNow.Set(); };   // draw from cache, refresh soon, never block
 
         tray = new NotifyIcon();
         tray.ContextMenuStrip = menu;
@@ -109,6 +129,10 @@ static class Program
         Thread poller = new Thread(PollLoop);
         poller.IsBackground = true;
         poller.Start();
+
+        Thread control = new Thread(ControlLoop);
+        control.IsBackground = true;
+        control.Start();
 
         Application.Run();
         GC.KeepAlive(mutex);
@@ -400,12 +424,273 @@ static class Program
 
     static void SaveTrayMinutes(int minutes)
     {
+        SaveTraySettings(minutes, Config);
+    }
+
+    // ---------- the model (which run config the server is started with) ----------
+
+    // Every strata-*.json in Root, sorted. Backups (.bak-tray-*) are not .json and never match.
+    static void DiscoverConfigs()
+    {
+        Configs.Clear();
+        try
+        {
+            foreach (string p in Directory.GetFiles(Root, "strata-*.json"))
+                if (p.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) Configs.Add(p);
+        }
+        catch { }
+        Configs.Sort(StringComparer.OrdinalIgnoreCase);
+    }
+
+    // The config's own model_name, else its file name.
+    static string ModelLabel(string path)
+    {
+        try
+        {
+            Match m = Regex.Match(File.ReadAllText(path), "\"model_name\"\\s*:\\s*\"([^\"]+)\"");
+            if (m.Success) return m.Groups[1].Value;
+        }
+        catch { }
+        return Path.GetFileNameWithoutExtension(path);
+    }
+
+    // NotifyIcon.Text is capped at 63 characters, so the menu carries the name, not the tooltip.
+    static string ShortLabel(string name)
+    {
+        const string prefix = "qwen3.8-flash-next-";
+        if (name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) name = name.Substring(prefix.Length);
+        return (name.Length > 32) ? name.Substring(0, 31) + "\u2026" : name;
+    }
+
+    static void BuildModelMenu()
+    {
+        modelMenu.DropDownItems.Clear();
+        modelMenu.Text = "Model: " + ShortLabel(ModelLabel(Config));
+        foreach (string path in Configs)
+        {
+            ToolStripMenuItem it = new ToolStripMenuItem(ModelLabel(path), null, OnPickModel);
+            it.Tag = path;
+            it.Checked = string.Equals(path, Config, StringComparison.OrdinalIgnoreCase);
+            modelMenu.DropDownItems.Add(it);
+        }
+        if (modelMenu.DropDownItems.Count == 0)
+        {
+            ToolStripMenuItem none = new ToolStripMenuItem("(no strata-*.json in " + Root + ")");
+            none.Enabled = false;
+            modelMenu.DropDownItems.Add(none);
+        }
+    }
+
+    // On menu open: a directory listing only, and the files are re-read just when the set changed.
+    static void RefreshModelMenu()
+    {
+        List<string> before = new List<string>(Configs);
+        DiscoverConfigs();
+        bool same = (before.Count == Configs.Count);
+        for (int i = 0; same && i < before.Count; i++)
+            same = string.Equals(before[i], Configs[i], StringComparison.OrdinalIgnoreCase);
+        if (!same) BuildModelMenu();
+    }
+
+    static void OnPickModel(object sender, EventArgs e)
+    {
+        ToolStripMenuItem it = sender as ToolStripMenuItem;
+        if (it == null || busy) return;
+        string path = it.Tag as string;
+        if (path == null || string.Equals(path, Config, StringComparison.OrdinalIgnoreCase)) return;
+
+        bool wasUp = (state == State.Running || state == State.Sleeping);
+        if (wasUp && MessageBox.Show("Switch to " + it.Text + "?\r\n\r\nStrata stops and starts again on the new model.",
+                                     "Strata", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+            return;
+
+        Config = path;
+        SaveTraySettings(LoadTrayMinutes(), Config);
+        BuildModelMenu();
+        if (!wasUp)
+        {
+            UpdateUi();
+            Balloon("Model set to " + it.Text + ". Start WebUI to load it.");
+            return;
+        }
+        string name = it.Text;
+        RunBusy(State.Stopping, delegate
+        {
+            StopServer();
+            for (int i = 0; i < 50 && PortListening(); i++) Thread.Sleep(100);   // let the port go
+            StartServer();
+            Say("Switched to " + name + ".");
+        });
+    }
+
+    static string LoadTrayConfig()
+    {
+        try
+        {
+            Match m = Regex.Match(File.ReadAllText(TraySettings), "\"config\"\\s*:\\s*\"([^\"]+)\"");
+            if (m.Success)
+            {
+                string p = m.Groups[1].Value.Replace("\\\\", "\\");
+                if (File.Exists(p)) return p;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    static void SaveTraySettings(int minutes, string config)
+    {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(TraySettings));
-            File.WriteAllText(TraySettings, "{ \"idleMinutes\": " + minutes + " }\r\n", new UTF8Encoding(false));
+            File.WriteAllText(TraySettings,
+                "{ \"idleMinutes\": " + minutes + ", \"config\": \"" + config.Replace("\\", "\\\\") + "\" }\r\n",
+                new UTF8Encoding(false));
         }
         catch { }
+    }
+
+    // ---------- control port: a client asks for a model by name ----------
+
+    // Loopback only, and a hand-rolled HTTP/1.1 reply: HttpListener would need a URL reservation.
+    static void ControlLoop()
+    {
+        TcpListener listener;
+        try
+        {
+            listener = new TcpListener(IPAddress.Loopback, ControlPort);
+            listener.Start();
+        }
+        catch (Exception ex)
+        {
+            Say("Model switching is off: port " + ControlPort + " (" + ex.Message + ")");
+            return;
+        }
+        while (true)
+        {
+            try
+            {
+                using (TcpClient c = listener.AcceptTcpClient()) Serve(c);
+            }
+            catch { }
+        }
+    }
+
+    static void Serve(TcpClient c)
+    {
+        c.ReceiveTimeout = 5000;
+        c.SendTimeout = 300000;                 // a switch can keep the caller waiting
+        NetworkStream s = c.GetStream();
+
+        StringBuilder head = new StringBuilder();
+        byte[] one = new byte[1];
+        while (head.Length < 8192)
+        {
+            int n = s.Read(one, 0, 1);
+            if (n <= 0) return;
+            head.Append((char)one[0]);
+            if (head.Length >= 4 && head[head.Length - 1] == 10 && head[head.Length - 3] == 10) break;
+        }
+        string text = head.ToString();
+        string[] lines = text.Split(new string[] { "\r\n" }, StringSplitOptions.None);
+        string[] first = lines[0].Split(' ');
+        if (first.Length < 2) { Reply(s, 400, "{\"error\":\"bad request\"}"); return; }
+        string method = first[0].ToUpperInvariant(), path = first[1];
+
+        int length = 0;
+        foreach (string line in lines)
+            if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                int.TryParse(line.Substring(15).Trim(), out length);
+        string body = "";
+        if (length > 0 && length < 65536)
+        {
+            byte[] buf = new byte[length];
+            int got = 0;
+            while (got < length)
+            {
+                int n = s.Read(buf, got, length - got);
+                if (n <= 0) break;
+                got += n;
+            }
+            body = Encoding.UTF8.GetString(buf, 0, got);
+        }
+
+        if (path != "/model") { Reply(s, 404, "{\"error\":\"unknown path\"}"); return; }
+
+        if (method == "GET")
+        {
+            DiscoverConfigs();
+            StringBuilder all = new StringBuilder();
+            foreach (string p in Configs)
+            {
+                if (all.Length > 0) all.Append(",");
+                all.Append("\"").Append(Escape(ModelLabel(p))).Append("\"");
+            }
+            Reply(s, 200, "{\"model\":\"" + Escape(ModelLabel(Config)) + "\",\"state\":\"" + state.ToString().ToLowerInvariant()
+                          + "\",\"models\":[" + all + "]}");
+            return;
+        }
+        if (method != "POST") { Reply(s, 405, "{\"error\":\"use GET or POST\"}"); return; }
+
+        Match m = Regex.Match(body, "\"(?:model|name)\"\\s*:\\s*\"([^\"]+)\"");
+        if (!m.Success) { Reply(s, 400, "{\"error\":\"send {\\\"model\\\": \\\"<name>\\\"}\"}"); return; }
+        string wanted = m.Groups[1].Value;
+
+        string err = SwitchTo(wanted);
+        if (err == null) Reply(s, 200, "{\"model\":\"" + Escape(ModelLabel(Config)) + "\",\"switched\":true}");
+        else Reply(s, 409, "{\"error\":\"" + Escape(err) + "\"}");
+    }
+
+    static string Escape(string x)
+    {
+        return (x ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"");
+    }
+
+    static void Reply(NetworkStream s, int code, string json)
+    {
+        byte[] payload = Encoding.UTF8.GetBytes(json);
+        string head = "HTTP/1.1 " + code + " \r\nContent-Type: application/json\r\nContent-Length: "
+                      + payload.Length + "\r\nConnection: close\r\n\r\n";
+        byte[] h = Encoding.UTF8.GetBytes(head);
+        try { s.Write(h, 0, h.Length); s.Write(payload, 0, payload.Length); s.Flush(); }
+        catch { }
+    }
+
+    // Puts the server on the config whose model_name is `wanted`. Returns null, or why it could not.
+    // Only the server is brought up: Strata is started with --lazy, so the weights load on the first
+    // request, which is the caller's own.
+    static string SwitchTo(string wanted)
+    {
+        DiscoverConfigs();
+        string target = null;
+        foreach (string p in Configs)
+            if (string.Equals(ModelLabel(p), wanted, StringComparison.OrdinalIgnoreCase)) { target = p; break; }
+        if (target == null) return "no config in " + Root + " has model_name \"" + wanted + "\"";
+
+        for (int i = 0; i < 600 && busy; i++) Thread.Sleep(100);     // let a menu action finish
+        if (busy) return "the tray is busy with another action";
+
+        bool same = string.Equals(target, Config, StringComparison.OrdinalIgnoreCase);
+        if (same && PortListening()) return null;                     // already serving it
+
+        busy = true;
+        try
+        {
+            if (PortListening())
+            {
+                StopServer();
+                for (int i = 0; i < 100 && PortListening(); i++) Thread.Sleep(100);
+            }
+            Config = target;
+            SaveTraySettings(LoadTrayMinutes(), Config);
+            OnUi(delegate { BuildModelMenu(); UpdateUi(); });
+            StartServer();
+            for (int i = 0; i < 600 && !PortListening(); i++) Thread.Sleep(100);
+            if (!PortListening()) return "Strata did not start listening on port " + Port;
+        }
+        finally { busy = false; pollNow.Set(); }
+        Say("Switched to " + wanted + " on request.");
+        return null;
     }
 
     // ---------- ui ----------
@@ -511,6 +796,7 @@ static class Program
         loadItem.Enabled = serverUp && !busy;
         loadItem.Text = (state == State.Sleeping) ? "Load Model" : "Unload Model";
         settingsItem.Enabled = !busy;
+        modelMenu.Enabled = !busy;
         switch (state)
         {
             case State.Running:
