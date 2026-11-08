@@ -29,6 +29,10 @@
 //      it with its own requests (status, load, unload), which Strata then refuses without it.
 // v16: model_name and api_key are read from the config's top level only. An "images" section has
 //      its own model_name, and the first match anywhere in the file named the wrong model.
+// v17: Image submenu. Every image model (.gguf) next to the run config's images.diffusion_model is
+//      listed; picking one points every run config's "images" section at it (and at the matching
+//      Qwen3-VL text encoder: BF16 for F16, else the same quant), then restarts Strata if it is up.
+//      The Model submenu no longer lists Strata's *.shared-settings.json (not a run config).
 // Build: build.cmd (uses the C# compiler that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -49,7 +53,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("StrataTray")]
 [assembly: AssemblyProduct("StrataTray")]
-[assembly: AssemblyVersion("16.0.0.0")]
+[assembly: AssemblyVersion("17.0.0.0")]
 [assembly: AssemblyFileVersion("14.0.0.0")]
 
 static class Program
@@ -73,7 +77,7 @@ static class Program
     enum State { Stopped, Starting, Running, Sleeping, Stopping }
 
     static NotifyIcon tray;
-    static ToolStripMenuItem toggleItem, loadItem, browserItem, settingsItem, modelMenu;
+    static ToolStripMenuItem toggleItem, loadItem, browserItem, settingsItem, modelMenu, imageMenu;
     static Icon iconRunning, iconStarting, iconStopped, iconSleeping;
     static Form syncForm;                       // hidden; owns the UI thread for BeginInvoke
 
@@ -117,15 +121,18 @@ static class Program
         settingsItem = new ToolStripMenuItem("Settings...", null, OnSettings);
         modelMenu = new ToolStripMenuItem("Model");
         BuildModelMenu();
+        imageMenu = new ToolStripMenuItem("Image");
+        BuildImageMenu();
         menu.Items.Add(toggleItem);
         menu.Items.Add(loadItem);
         menu.Items.Add(browserItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(modelMenu);
+        menu.Items.Add(imageMenu);
         menu.Items.Add(settingsItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("Exit", null, OnExit));
-        menu.Opening += delegate { RefreshModelMenu(); UpdateUi(); pollNow.Set(); };   // draw from cache, refresh soon, never block
+        menu.Opening += delegate { RefreshModelMenu(); BuildImageMenu(); UpdateUi(); pollNow.Set(); };   // draw from cache, refresh soon, never block
 
         tray = new NotifyIcon();
         tray.ContextMenuStrip = menu;
@@ -467,36 +474,80 @@ static class Program
         try
         {
             foreach (string p in Directory.GetFiles(Root, "strata-*.json"))
-                if (p.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) Configs.Add(p);
+                if (p.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
+                    && !p.EndsWith(".shared-settings.json", StringComparison.OrdinalIgnoreCase)) Configs.Add(p);
         }
         catch { }
         Configs.Sort(StringComparer.OrdinalIgnoreCase);
     }
 
     // The string value of `key` in the JSON object's top level (not inside a nested section), or null.
-    // Walks the text once, skipping strings, so a key of the same name deeper down never matches.
     static string TopLevelString(string json, string key)
     {
+        int v = ValueAt(json, json.IndexOf('{'), key);
+        if (v < 0 || json[v] != '"') return null;              // missing, or not a string (a list of keys, a number)
+        return ReadJsonString(json, ref v);
+    }
+
+    // The string value of section.key (e.g. images.diffusion_model), or null.
+    static string SectionString(string json, string section, string key)
+    {
+        int o = ValueAt(json, json.IndexOf('{'), section);
+        if (o < 0 || json[o] != '{') return null;
+        int v = ValueAt(json, o, key);
+        if (v < 0 || json[v] != '"') return null;
+        return ReadJsonString(json, ref v);
+    }
+
+    // Replaces the string value of section.key, keeping every other byte. false = no such string value.
+    static bool SetSectionString(ref string json, string section, string key, string value)
+    {
+        int o = ValueAt(json, json.IndexOf('{'), section);
+        if (o < 0 || json[o] != '{') return false;
+        int v = ValueAt(json, o, key);
+        if (v < 0 || json[v] != '"') return false;
+        int end = v;
+        if (ReadJsonString(json, ref end) == null) return false;
+        json = json.Substring(0, v) + JsonQuote(value) + json.Substring(end);
+        return true;
+    }
+
+    // Index where the value of `key` starts, for the key directly inside the object that opens at json[open]
+    // ('{'), never one deeper down; -1 = not there. Strings are skipped whole, so braces inside them never count.
+    static int ValueAt(string json, int open, string key)
+    {
+        if (open < 0 || open >= json.Length || json[open] != '{') return -1;
         int depth = 0;
-        int i = 0;
+        int i = open;
         while (i < json.Length)
         {
             char c = json[i];
             if (c == '{' || c == '[') { depth++; i++; continue; }
-            if (c == '}' || c == ']') { depth--; i++; continue; }
+            if (c == '}' || c == ']') { depth--; i++; if (depth == 0) return -1; continue; }
             if (c != '"') { i++; continue; }
             string str = ReadJsonString(json, ref i);         // i is now just past the closing quote
-            if (str == null) return null;
+            if (str == null) return -1;
             if (depth != 1 || str != key) continue;
             int j = i;
             while (j < json.Length && char.IsWhiteSpace(json[j])) j++;
             if (j >= json.Length || json[j] != ':') continue;   // a value that equals the key, not the key
             j++;
             while (j < json.Length && char.IsWhiteSpace(json[j])) j++;
-            if (j >= json.Length || json[j] != '"') return null; // not a string (a list of keys, a number)
-            return ReadJsonString(json, ref j);
+            return (j < json.Length) ? j : -1;
         }
-        return null;
+        return -1;
+    }
+
+    static string JsonQuote(string x)
+    {
+        StringBuilder sb = new StringBuilder("\"");
+        foreach (char c in x)
+        {
+            if (c == '"' || c == '\\') sb.Append('\\').Append(c);
+            else if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4"));
+            else sb.Append(c);
+        }
+        return sb.Append('"').ToString();
     }
 
     // Reads the JSON string starting at json[i] == '"', unescaping it; leaves i past its end. null = unterminated.
@@ -605,6 +656,126 @@ static class Program
             for (int i = 0; i < 50 && PortListening(); i++) Thread.Sleep(100);   // let the port go
             StartServer();
             Say("Switched to " + name + ".");
+        });
+    }
+
+    // ---------- the image model (the run configs' "images" section) ----------
+
+    // The text encoder that goes with an image model: same folder, Qwen3-VL-*-<quant>.gguf, where an F16
+    // image model takes the BF16 encoder (then F16). null = none found (the current one is kept).
+    static string EncoderFor(string imageModel)
+    {
+        string dir = Path.GetDirectoryName(imageModel);
+        string stem = Path.GetFileNameWithoutExtension(imageModel);
+        int dash = stem.LastIndexOf('-');
+        if (dash < 0) return null;
+        string quant = stem.Substring(dash + 1);
+        string[] wanted = quant.Equals("F16", StringComparison.OrdinalIgnoreCase)
+            ? new string[] { "BF16", "F16" } : new string[] { quant };
+        foreach (string q in wanted)
+            foreach (string f in Directory.GetFiles(dir, "Qwen3-VL-*-" + q + ".gguf"))
+                return f;
+        return null;
+    }
+
+    static string QuantOf(string imageModel)
+    {
+        string stem = Path.GetFileNameWithoutExtension(imageModel);
+        int dash = stem.LastIndexOf('-');
+        return dash < 0 ? stem : stem.Substring(dash + 1);
+    }
+
+    // Rebuilt on every menu open: one directory listing and one config read.
+    static void BuildImageMenu()
+    {
+        imageMenu.DropDownItems.Clear();
+        string current = null;
+        try { current = SectionString(File.ReadAllText(Config), "images", "diffusion_model"); } catch { }
+        if (current == null)
+        {
+            imageMenu.Text = "Image: off";
+            ToolStripMenuItem none = new ToolStripMenuItem("(this run config has no \"images\" section)");
+            none.Enabled = false;
+            imageMenu.DropDownItems.Add(none);
+            return;
+        }
+        imageMenu.Text = "Image: " + Path.GetFileNameWithoutExtension(current);
+        List<string> models = new List<string>();
+        try
+        {
+            foreach (string f in Directory.GetFiles(Path.GetDirectoryName(current), "*.gguf"))
+                if (!Path.GetFileName(f).StartsWith("Qwen3-VL", StringComparison.OrdinalIgnoreCase)) models.Add(f);
+        }
+        catch { }
+        models.Sort(StringComparer.OrdinalIgnoreCase);
+        foreach (string f in models)
+        {
+            ToolStripMenuItem it = new ToolStripMenuItem(Path.GetFileNameWithoutExtension(f), null, OnPickImage);
+            it.Tag = f;
+            it.Checked = string.Equals(f, current, StringComparison.OrdinalIgnoreCase);
+            imageMenu.DropDownItems.Add(it);
+        }
+        if (models.Count == 0)
+        {
+            ToolStripMenuItem none = new ToolStripMenuItem("(no .gguf next to " + current + ")");
+            none.Enabled = false;
+            imageMenu.DropDownItems.Add(none);
+        }
+    }
+
+    // Points every run config that has an "images" section at `model` (and its encoder). Returns why not, or null.
+    static string SetImageModel(string model)
+    {
+        string encoder = EncoderFor(model);
+        string stem = Path.GetFileNameWithoutExtension(model);
+        string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+        int done = 0;
+        foreach (string path in Configs)
+        {
+            string text = File.ReadAllText(path);
+            if (SectionString(text, "images", "diffusion_model") == null) continue;
+            string updated = text;
+            SetSectionString(ref updated, "images", "diffusion_model", model);
+            if (encoder != null) SetSectionString(ref updated, "images", "llm", encoder);
+            SetSectionString(ref updated, "images", "quant", QuantOf(model));       // only when the key is there
+            SetSectionString(ref updated, "images", "model_name", stem);
+            if (updated == text) { done++; continue; }
+            File.Copy(path, path + ".bak-tray-" + stamp, true);
+            File.WriteAllText(path, updated, new UTF8Encoding(false));
+            done++;
+        }
+        return done == 0 ? "no run config in " + Root + " has an \"images\" section" : null;
+    }
+
+    static void OnPickImage(object sender, EventArgs e)
+    {
+        ToolStripMenuItem it = sender as ToolStripMenuItem;
+        if (it == null || busy || it.Checked) return;
+        string model = it.Tag as string;
+        if (model == null) return;
+
+        bool wasUp = (state == State.Running || state == State.Sleeping);
+        if (wasUp && MessageBox.Show("Switch the image model to " + it.Text + "?\r\n\r\nStrata stops and starts again to use it.",
+                                     "Strata", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+            return;
+
+        string why;
+        try { why = SetImageModel(model); } catch (Exception ex) { why = ex.Message; }
+        if (why != null) { Balloon("Image model not switched: " + why); return; }
+        BuildImageMenu();
+        if (!wasUp)
+        {
+            UpdateUi();
+            Balloon("Image model set to " + it.Text + ". Start WebUI to use it.");
+            return;
+        }
+        string name = it.Text;
+        RunBusy(State.Stopping, delegate
+        {
+            StopServer();
+            for (int i = 0; i < 50 && PortListening(); i++) Thread.Sleep(100);   // let the port go
+            StartServer();
+            Say("Image model: " + name + ".");
         });
     }
 
@@ -918,6 +1089,7 @@ static class Program
         loadItem.Text = (state == State.Sleeping) ? "Load Model" : "Unload Model";
         settingsItem.Enabled = !busy;
         modelMenu.Enabled = !busy;
+        imageMenu.Enabled = !busy;
         switch (state)
         {
             case State.Running:

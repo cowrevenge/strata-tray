@@ -69,3 +69,10 @@ which a page cannot send cross-site without a CORS preflight, and the port never
 
 If Strata has an API key (`STRATA_API_KEY`, else `"api_key"` in the run config), the tray sends it with its own
 requests to Strata (status, Load, Unload). Nothing else to set.
+
+## Image model
+
+**Image** lists every image model (.gguf) in the folder of the run config's `images.diffusion_model`.
+Picking one points every run config's `images` section at it, with the matching Qwen3-VL text encoder
+(BF16 for an F16 model, else the same quant), and restarts Strata if it is up. Each changed config is
+backed up as `.bak-tray-<time>` first.
