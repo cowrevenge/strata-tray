@@ -58,3 +58,9 @@ lazily, so the weights load inside the caller's own first request.
 
 Loopback only, and the reply is written straight to the socket, since `HttpListener` would need a
 URL reservation or an elevated tray.
+
+Only local programs may use it, never web pages. Any website open in a browser on this PC can send
+requests to `127.0.0.1`, so a request is refused (403) when it carries a browser's marks (an `Origin`
+or `Sec-Fetch-*` header: cross-site request forgery) or when its `Host` is not `127.0.0.1:8081`,
+`localhost:8081` or `[::1]:8081` (DNS rebinding). A POST must be `Content-Type: application/json`,
+which a page cannot send cross-site without a CORS preflight, and the port never grants one.

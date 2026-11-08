@@ -20,6 +20,11 @@
 //                                            server is listening again (Strata loads lazily,
 //                                            so the weights load inside the caller's own
 //                                            first request, as they always did).
+// v14: the control port answers only local programs, never web pages. Any website in a browser on
+//      this PC can send requests to 127.0.0.1, so a request is refused when it carries a browser's
+//      marks (an Origin or Sec-Fetch-* header: cross-site request forgery), when its Host is not
+//      this port on loopback (DNS rebinding), and a POST must be application/json (a page cannot
+//      send that cross-site without a CORS preflight, which the port never grants).
 // Build: build.cmd (uses the C# compiler that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -40,8 +45,8 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("StrataTray")]
 [assembly: AssemblyProduct("StrataTray")]
-[assembly: AssemblyVersion("13.0.0.0")]
-[assembly: AssemblyFileVersion("13.0.0.0")]
+[assembly: AssemblyVersion("14.0.0.0")]
+[assembly: AssemblyFileVersion("14.0.0.0")]
 
 static class Program
 {
@@ -615,6 +620,9 @@ static class Program
             body = Encoding.UTF8.GetString(buf, 0, got);
         }
 
+        string refusal = RefuseNonLocal(lines, method);
+        if (refusal != null) { Reply(s, 403, "{\"error\":\"" + Escape(refusal) + "\"}"); return; }
+
         if (path != "/model") { Reply(s, 404, "{\"error\":\"unknown path\"}"); return; }
 
         if (method == "GET")
@@ -639,6 +647,39 @@ static class Program
         string err = SwitchTo(wanted);
         if (err == null) Reply(s, 200, "{\"model\":\"" + Escape(ModelLabel(Config)) + "\",\"switched\":true}");
         else Reply(s, 409, "{\"error\":\"" + Escape(err) + "\"}");
+    }
+
+    static string HeaderValue(string[] lines, string name)
+    {
+        for (int i = 1; i < lines.Length; i++)
+        {
+            int colon = lines[i].IndexOf(':');
+            if (colon > 0 && string.Equals(lines[i].Substring(0, colon).Trim(), name, StringComparison.OrdinalIgnoreCase))
+                return lines[i].Substring(colon + 1).Trim();
+        }
+        return null;
+    }
+
+    // Why a request may not use the control port, or null. Programs on this PC (Goose) send none of a
+    // browser's marks; a web page cannot avoid them.
+    static string RefuseNonLocal(string[] lines, string method)
+    {
+        if (HeaderValue(lines, "Origin") != null || HeaderValue(lines, "Sec-Fetch-Site") != null
+            || HeaderValue(lines, "Sec-Fetch-Mode") != null)
+            return "web pages may not use the tray's control port";
+
+        string host = (HeaderValue(lines, "Host") ?? "").ToLowerInvariant();
+        string port = ":" + ControlPort;
+        if (host != "127.0.0.1" + port && host != "localhost" + port && host != "[::1]" + port)
+            return "Host '" + host + "' is not this port on loopback (DNS rebinding protection)";
+
+        if (method == "POST")
+        {
+            string type = (HeaderValue(lines, "Content-Type") ?? "").ToLowerInvariant();
+            if (!type.StartsWith("application/json"))
+                return "POST needs Content-Type: application/json";
+        }
+        return null;
     }
 
     static string Escape(string x)
