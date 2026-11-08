@@ -64,3 +64,8 @@ requests to `127.0.0.1`, so a request is refused (403) when it carries a browser
 or `Sec-Fetch-*` header: cross-site request forgery) or when its `Host` is not `127.0.0.1:8081`,
 `localhost:8081` or `[::1]:8081` (DNS rebinding). A POST must be `Content-Type: application/json`,
 which a page cannot send cross-site without a CORS preflight, and the port never grants one.
+
+## API key
+
+If Strata has an API key (`STRATA_API_KEY`, else `"api_key"` in the run config), the tray sends it with its own
+requests to Strata (status, Load, Unload). Nothing else to set.

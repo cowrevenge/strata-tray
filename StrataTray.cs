@@ -25,6 +25,8 @@
 //      marks (an Origin or Sec-Fetch-* header: cross-site request forgery), when its Host is not
 //      this port on loopback (DNS rebinding), and a POST must be application/json (a page cannot
 //      send that cross-site without a CORS preflight, which the port never grants).
+// v15: when Strata has an API key (STRATA_API_KEY, else "api_key" in the run config), the tray sends
+//      it with its own requests (status, load, unload), which Strata then refuses without it.
 // Build: build.cmd (uses the C# compiler that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -45,7 +47,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("StrataTray")]
 [assembly: AssemblyProduct("StrataTray")]
-[assembly: AssemblyVersion("14.0.0.0")]
+[assembly: AssemblyVersion("15.0.0.0")]
 [assembly: AssemblyFileVersion("14.0.0.0")]
 
 static class Program
@@ -206,6 +208,27 @@ static class Program
         return false;
     }
 
+    // The key Strata answers to, as Strata reads it: STRATA_API_KEY first, else the run config's
+    // "api_key" (a string; several keys are comma separated, the first is used). null = no key,
+    // also for "none" (served without a key on purpose). Read per request, so an edit is seen at once.
+    static string ApiKey()
+    {
+        string raw = Environment.GetEnvironmentVariable("STRATA_API_KEY");
+        if (string.IsNullOrEmpty(raw))
+        {
+            try
+            {
+                Match m = Regex.Match(File.ReadAllText(Config), "\"api_key\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+                if (m.Success) raw = Regex.Unescape(m.Groups[1].Value);
+            }
+            catch { }
+        }
+        if (string.IsNullOrEmpty(raw)) return null;
+        string first = raw.Split(',')[0].Trim();
+        if (first.Length == 0 || first.Equals("none", StringComparison.OrdinalIgnoreCase)) return null;
+        return first;
+    }
+
     // 0 = no answer; otherwise the HTTP status code. Body is the response (or error) text.
     static int Http(string method, string path, string json, out string body)
     {
@@ -218,6 +241,8 @@ static class Program
             req.ReadWriteTimeout = req.Timeout;
             req.Proxy = null;
             req.KeepAlive = false;
+            string key = ApiKey();
+            if (key != null) req.Headers["Authorization"] = "Bearer " + key;
             if (json != null)
             {
                 byte[] data = Encoding.UTF8.GetBytes(json);
