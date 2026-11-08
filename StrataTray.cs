@@ -33,6 +33,10 @@
 //      listed; picking one points every run config's "images" section at it (and at the matching
 //      Qwen3-VL text encoder: BF16 for F16, else the same quant), then restarts Strata if it is up.
 //      The Model submenu no longer lists Strata's *.shared-settings.json (not a run config).
+// v18: the control port switches the image model too, so a client (Goose's generate_image) can:
+//        GET  /image                    -> {"model":...,"models":[...]}  (names = file names without .gguf)
+//        POST /image {"model":"<name>"} -> points the configs at it and returns when Strata is
+//                                          listening again (no restart when it is already the one).
 // Build: build.cmd (uses the C# compiler that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -53,7 +57,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("StrataTray")]
 [assembly: AssemblyProduct("StrataTray")]
-[assembly: AssemblyVersion("17.0.0.0")]
+[assembly: AssemblyVersion("18.0.0.0")]
 [assembly: AssemblyFileVersion("14.0.0.0")]
 
 static class Program
@@ -685,12 +689,29 @@ static class Program
         return dash < 0 ? stem : stem.Substring(dash + 1);
     }
 
+    // The image models next to the run config's images.diffusion_model (`current`, null = no images section).
+    static List<string> ImageModels(out string current)
+    {
+        current = null;
+        List<string> models = new List<string>();
+        try { current = SectionString(File.ReadAllText(Config), "images", "diffusion_model"); } catch { }
+        if (current == null) return models;
+        try
+        {
+            foreach (string f in Directory.GetFiles(Path.GetDirectoryName(current), "*.gguf"))
+                if (!Path.GetFileName(f).StartsWith("Qwen3-VL", StringComparison.OrdinalIgnoreCase)) models.Add(f);
+        }
+        catch { }
+        models.Sort(StringComparer.OrdinalIgnoreCase);
+        return models;
+    }
+
     // Rebuilt on every menu open: one directory listing and one config read.
     static void BuildImageMenu()
     {
         imageMenu.DropDownItems.Clear();
-        string current = null;
-        try { current = SectionString(File.ReadAllText(Config), "images", "diffusion_model"); } catch { }
+        string current;
+        List<string> models = ImageModels(out current);
         if (current == null)
         {
             imageMenu.Text = "Image: off";
@@ -700,14 +721,6 @@ static class Program
             return;
         }
         imageMenu.Text = "Image: " + Path.GetFileNameWithoutExtension(current);
-        List<string> models = new List<string>();
-        try
-        {
-            foreach (string f in Directory.GetFiles(Path.GetDirectoryName(current), "*.gguf"))
-                if (!Path.GetFileName(f).StartsWith("Qwen3-VL", StringComparison.OrdinalIgnoreCase)) models.Add(f);
-        }
-        catch { }
-        models.Sort(StringComparer.OrdinalIgnoreCase);
         foreach (string f in models)
         {
             ToolStripMenuItem it = new ToolStripMenuItem(Path.GetFileNameWithoutExtension(f), null, OnPickImage);
@@ -874,6 +887,7 @@ static class Program
         string refusal = RefuseNonLocal(lines, method);
         if (refusal != null) { Reply(s, 403, "{\"error\":\"" + Escape(refusal) + "\"}"); return; }
 
+        if (path == "/image") { ServeImage(s, method, body); return; }
         if (path != "/model") { Reply(s, 404, "{\"error\":\"unknown path\"}"); return; }
 
         if (method == "GET")
@@ -897,6 +911,30 @@ static class Program
 
         string err = SwitchTo(wanted);
         if (err == null) Reply(s, 200, "{\"model\":\"" + Escape(ModelLabel(Config)) + "\",\"switched\":true}");
+        else Reply(s, 409, "{\"error\":\"" + Escape(err) + "\"}");
+    }
+
+    static void ServeImage(NetworkStream s, string method, string body)
+    {
+        if (method == "GET")
+        {
+            string current;
+            List<string> models = ImageModels(out current);
+            StringBuilder all = new StringBuilder();
+            foreach (string f in models)
+            {
+                if (all.Length > 0) all.Append(",");
+                all.Append("\"").Append(Escape(Path.GetFileNameWithoutExtension(f))).Append("\"");
+            }
+            string cur = current == null ? "null" : "\"" + Escape(Path.GetFileNameWithoutExtension(current)) + "\"";
+            Reply(s, 200, "{\"model\":" + cur + ",\"models\":[" + all + "]}");
+            return;
+        }
+        if (method != "POST") { Reply(s, 405, "{\"error\":\"use GET or POST\"}"); return; }
+        Match m = Regex.Match(body, "\"(?:model|name)\"\\s*:\\s*\"([^\"]+)\"");
+        if (!m.Success) { Reply(s, 400, "{\"error\":\"send {\\\"model\\\": \\\"<name>\\\"}\"}"); return; }
+        string err = SwitchImageTo(m.Groups[1].Value);
+        if (err == null) Reply(s, 200, "{\"model\":\"" + Escape(m.Groups[1].Value) + "\",\"switched\":true}");
         else Reply(s, 409, "{\"error\":\"" + Escape(err) + "\"}");
     }
 
@@ -982,6 +1020,48 @@ static class Program
         }
         finally { busy = false; pollNow.Set(); }
         Say("Switched to " + wanted + " on request.");
+        return null;
+    }
+
+    // The control port's image switch: the same as picking it in the Image menu, without the question.
+    static string SwitchImageTo(string wanted)
+    {
+        string current;
+        List<string> models = ImageModels(out current);
+        if (current == null) return "the run config " + Path.GetFileName(Config) + " has no \"images\" section";
+        string target = null;
+        List<string> names = new List<string>();
+        foreach (string f in models)
+        {
+            string stem = Path.GetFileNameWithoutExtension(f);
+            names.Add(stem);
+            if (string.Equals(stem, wanted, StringComparison.OrdinalIgnoreCase)) target = f;
+        }
+        if (target == null) return "no image model \"" + wanted + "\"; there are: " + string.Join(", ", names.ToArray());
+
+        for (int i = 0; i < 600 && busy; i++) Thread.Sleep(100);     // let a menu action finish
+        if (busy) return "the tray is busy with another action";
+
+        bool same = string.Equals(target, current, StringComparison.OrdinalIgnoreCase);
+        if (same && PortListening()) return null;                     // already the one in use
+
+        busy = true;
+        try
+        {
+            string why = SetImageModel(target);
+            if (why != null) return why;
+            OnUi(delegate { BuildImageMenu(); UpdateUi(); });
+            if (PortListening())
+            {
+                StopServer();
+                for (int i = 0; i < 100 && PortListening(); i++) Thread.Sleep(100);
+            }
+            StartServer();
+            for (int i = 0; i < 600 && !PortListening(); i++) Thread.Sleep(100);
+            if (!PortListening()) return "Strata did not start listening on port " + Port;
+        }
+        finally { busy = false; pollNow.Set(); }
+        Say("Image model: " + Path.GetFileNameWithoutExtension(target) + " (on request).");
         return null;
     }
 

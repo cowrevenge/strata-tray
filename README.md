@@ -76,3 +76,7 @@ requests to Strata (status, Load, Unload). Nothing else to set.
 Picking one points every run config's `images` section at it, with the matching Qwen3-VL text encoder
 (BF16 for an F16 model, else the same quant), and restarts Strata if it is up. Each changed config is
 backed up as `.bak-tray-<time>` first.
+
+The control port switches it too: `GET /image` lists the image models (file names without `.gguf`),
+`POST /image {"model":"<name>"}` switches and answers once Strata is listening again. Goose's
+`generate_image` tool uses this when asked for a model.
