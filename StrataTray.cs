@@ -27,6 +27,8 @@
 //      send that cross-site without a CORS preflight, which the port never grants).
 // v15: when Strata has an API key (STRATA_API_KEY, else "api_key" in the run config), the tray sends
 //      it with its own requests (status, load, unload), which Strata then refuses without it.
+// v16: model_name and api_key are read from the config's top level only. An "images" section has
+//      its own model_name, and the first match anywhere in the file named the wrong model.
 // Build: build.cmd (uses the C# compiler that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -47,7 +49,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("StrataTray")]
 [assembly: AssemblyProduct("StrataTray")]
-[assembly: AssemblyVersion("15.0.0.0")]
+[assembly: AssemblyVersion("16.0.0.0")]
 [assembly: AssemblyFileVersion("14.0.0.0")]
 
 static class Program
@@ -218,8 +220,7 @@ static class Program
         {
             try
             {
-                Match m = Regex.Match(File.ReadAllText(Config), "\"api_key\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
-                if (m.Success) raw = Regex.Unescape(m.Groups[1].Value);
+                raw = TopLevelString(File.ReadAllText(Config), "api_key");
             }
             catch { }
         }
@@ -472,13 +473,67 @@ static class Program
         Configs.Sort(StringComparer.OrdinalIgnoreCase);
     }
 
+    // The string value of `key` in the JSON object's top level (not inside a nested section), or null.
+    // Walks the text once, skipping strings, so a key of the same name deeper down never matches.
+    static string TopLevelString(string json, string key)
+    {
+        int depth = 0;
+        int i = 0;
+        while (i < json.Length)
+        {
+            char c = json[i];
+            if (c == '{' || c == '[') { depth++; i++; continue; }
+            if (c == '}' || c == ']') { depth--; i++; continue; }
+            if (c != '"') { i++; continue; }
+            string str = ReadJsonString(json, ref i);         // i is now just past the closing quote
+            if (str == null) return null;
+            if (depth != 1 || str != key) continue;
+            int j = i;
+            while (j < json.Length && char.IsWhiteSpace(json[j])) j++;
+            if (j >= json.Length || json[j] != ':') continue;   // a value that equals the key, not the key
+            j++;
+            while (j < json.Length && char.IsWhiteSpace(json[j])) j++;
+            if (j >= json.Length || json[j] != '"') return null; // not a string (a list of keys, a number)
+            return ReadJsonString(json, ref j);
+        }
+        return null;
+    }
+
+    // Reads the JSON string starting at json[i] == '"', unescaping it; leaves i past its end. null = unterminated.
+    static string ReadJsonString(string json, ref int i)
+    {
+        StringBuilder sb = new StringBuilder();
+        i++;
+        while (i < json.Length)
+        {
+            char c = json[i++];
+            if (c == '"') return sb.ToString();
+            if (c != '\\') { sb.Append(c); continue; }
+            if (i >= json.Length) return null;
+            char e = json[i++];
+            switch (e)
+            {
+                case 'n': sb.Append('\n'); break;
+                case 't': sb.Append('\t'); break;
+                case 'r': sb.Append('\r'); break;
+                case 'b': sb.Append('\b'); break;
+                case 'f': sb.Append('\f'); break;
+                case 'u':
+                    if (i + 4 > json.Length) return null;
+                    sb.Append((char)Convert.ToInt32(json.Substring(i, 4), 16)); i += 4; break;
+                default: sb.Append(e); break;                  // \" \\ \/
+            }
+        }
+        return null;
+    }
+
     // The config's own model_name, else its file name.
     static string ModelLabel(string path)
     {
         try
         {
-            Match m = Regex.Match(File.ReadAllText(path), "\"model_name\"\\s*:\\s*\"([^\"]+)\"");
-            if (m.Success) return m.Groups[1].Value;
+            string name = TopLevelString(File.ReadAllText(path), "model_name");
+            if (!string.IsNullOrEmpty(name)) return name;
         }
         catch { }
         return Path.GetFileNameWithoutExtension(path);
